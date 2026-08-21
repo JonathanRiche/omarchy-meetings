@@ -1,0 +1,259 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# meetings-widget — agenda als JSON voor de bar-widget.
+#
+#   meetings-widget day             # vandaag
+#   meetings-widget day 1           # morgen, -1 is gisteren
+#   meetings-widget day 0 --only "Paul - WBSO.ai"   # alleen die agenda
+#   meetings-widget week            # deze week, maandag tot en met zondag
+#   meetings-widget week -1         # vorige week
+#
+# Leest gcalcli's TSV: start_date, start_time, end_date, end_time, title,
+# calendar. Een lege tijd betekent een dag-event.
+#
+# De regels hieronder komen uit het waybar-script dat hieraan voorafging
+# (meetings-list.sh); die keuzes waren doordacht en zijn hier overgenomen in
+# plaats van opnieuw verzonnen.
+
+require "json"
+require "time"
+require "date"
+
+SKIP_CALENDARS = (ENV["MEETINGS_SKIP_CALENDARS"] || "Paul - WBSO.ai,Marjolein").split(",").map(&:strip)
+
+# Met --only draait het filter om: dan is die ene agenda juist het enige dat
+# telt. Bedoeld om even in andermans dag te kijken zonder je eigen agenda
+# ertussen, dus zonder de overslaan-lijst.
+ONLY_CALENDAR = begin
+  index = ARGV.index("--only")
+  index ? ARGV[index + 1] : nil
+end
+SKIP_TITLES = ["Afwezig", "Geen geplande meetings"].freeze
+
+# Kleur en volgorde per kalender. De oude module zette hier een emoji-blokje
+# voor; dit zijn dezelfde groepen, nu als kleur die de widget kan tekenen.
+# Prioriteit bepaalt welke afspraak de bar haalt als er twee tegelijk lopen:
+# werk gaat voor, privé komt daarna.
+CALENDAR_STYLES = [
+  { match: /WBSO/,                   color: "#4a9eff", priority: 1 },
+  { match: /\A(Jankees|Zakelijk)\z/, color: "#ff5c5c", priority: 2 },
+  { match: /Gezamenlijk/,            color: "#f5c518", priority: 3 },
+].freeze
+
+DEFAULT_STYLE = { color: "#9aa0a6", priority: 4 }.freeze
+
+# Andermans agenda krijgt geen eigen kleur maar het neutrale grijs. Zijn
+# WBSO-afspraken zouden anders hetzelfde blauw krijgen als die van jou, en dan
+# lijkt het je eigen dag; zwart viel juist zo ver weg dat de blokken niet meer
+# te zien waren.
+BORROWED_STYLE = { color: "#9aa0a6", priority: 4 }.freeze
+
+def style_for(calendar)
+  return BORROWED_STYLE if ONLY_CALENDAR
+
+  CALENDAR_STYLES.find { |s| s[:match].match?(calendar.to_s) } || DEFAULT_STYLE
+end
+
+# Kolommen op naam lezen in plaats van op positie: de volgorde verschuift met
+# elke --details die erbij komt, en dan verschuift alles stilzwijgend mee.
+# Zonder expliciet bereik begint gcalcli agenda bij nu, dus bestaat gisteren
+# domweg niet en levert terugbladeren een lege dag op. Het bereik loopt tot de
+# dag erna, want gcalcli hanteert een exclusief einde.
+def parse_rows(from_day, to_day)
+  from = from_day.strftime("%Y-%m-%d")
+  to = (to_day + 1).strftime("%Y-%m-%d")
+  raw = `gcalcli agenda --tsv --nodeclined --details calendar --details id --details url #{from} #{to} 2>/dev/null`
+  return nil unless $?.success?
+
+  lines = raw.lines
+  return [] if lines.empty?
+
+  headers = lines.first.chomp.split("\t")
+  lines.drop(1).map do |line|
+    headers.zip(line.chomp.split("\t")).to_h
+  end
+end
+
+def event_from(row, day)
+  start_date = row["start_date"]
+  start_time = row["start_time"]
+  end_date = row["end_date"]
+  end_time = row["end_time"]
+  title = row["title"]
+  calendar = row["calendar"]
+
+  # html_link bevat de eid die Google zelf gebruikt, dus die hoeven we niet na
+  # te bouwen uit event- en agenda-id.
+  link = row["html_link"].to_s
+  hangout = row["hangout_link"].to_s
+  return nil if title.nil? || title.empty?
+  return nil if SKIP_TITLES.include?(title)
+
+  if ONLY_CALENDAR
+    return nil unless calendar.to_s == ONLY_CALENDAR
+  elsif SKIP_CALENDARS.include?(calendar)
+    return nil
+  end
+
+  style = style_for(calendar)
+
+  # Dag-events hebben geen tijd en lopen vaak over meerdere dagen. gcalcli
+  # geeft de einddatum exclusief, net als de Google-API zelf.
+  if start_time.nil? || start_time.empty?
+    first = Date.parse(start_date)
+    last = Date.parse(end_date) - 1
+    return nil unless (first..last).cover?(day)
+
+    return {
+      allday: true, title: title, calendar: calendar,
+      color: style[:color], priority: style[:priority],
+      multiday: first != last,
+      link: link,
+    }
+  end
+
+  starts = Time.parse("#{start_date} #{start_time}")
+  ends = Time.parse("#{end_date} #{end_time}")
+  return nil unless starts.to_date == day
+
+  {
+    allday: false,
+    title: title,
+    calendar: calendar,
+    color: style[:color],
+    priority: style[:priority],
+    start: starts.strftime("%H:%M"),
+    end: ends.strftime("%H:%M"),
+    start_minutes: starts.hour * 60 + starts.min,
+    end_minutes: ends.hour * 60 + ends.min,
+    start_epoch: starts.to_i,
+    end_epoch: ends.to_i,
+    link: link,
+    hangout: hangout,
+  }
+end
+
+# Overlappende afspraken naast elkaar, zoals een agenda dat doet. Zonder dit
+# tekenen ze over elkaar heen en verdwijnt alles wat binnen een lange afspraak
+# valt: een samenwerkdag van 09:00 tot 18:00 slokt dan de vier overleggen op
+# die erin zitten.
+#
+# Eerst clusteren op overlap, dan binnen een cluster de eerste kolom pakken die
+# vrij is. Elk event krijgt zijn kolom en het totaal van dat cluster mee, zodat
+# de widget alleen nog hoeft te delen.
+def assign_columns(events)
+  cluster = []
+  cluster_end = nil
+
+  flush = lambda do
+    columns = []
+    cluster.each do |event|
+      slot = columns.index { |free_at| free_at <= event[:start_minutes] }
+      if slot.nil?
+        columns << event[:end_minutes]
+        slot = columns.length - 1
+      else
+        columns[slot] = event[:end_minutes]
+      end
+      event[:column] = slot
+    end
+    cluster.each { |event| event[:columns] = columns.length }
+    cluster = []
+  end
+
+  events.each do |event|
+    if cluster_end.nil? || event[:start_minutes] < cluster_end
+      cluster << event
+      cluster_end = [cluster_end || 0, event[:end_minutes]].max
+    else
+      flush.call
+      cluster << event
+      cluster_end = event[:end_minutes]
+    end
+  end
+  flush.call
+
+  events
+end
+
+# Eén dag samenstellen uit de rijen van het hele opgevraagde bereik.
+def build_day(rows, day)
+  parsed = rows.filter_map { |row| event_from(row, day) }
+
+  # Ontdubbelen op titel plus starttijd: dezelfde afspraak staat vaak in twee
+  # agenda's die je allebei ziet.
+  seen = {}
+  timed = parsed.reject { |e| e[:allday] }.reject do |e|
+    key = "#{e[:title]}|#{e[:start_epoch]}"
+    seen.key?(key).tap { seen[key] = true }
+  end.sort_by { |e| e[:start_minutes] }
+
+  {
+    # Zonder leidende nullen, want zo wil Google Calendar het in zijn url.
+    date_path: "#{day.year}/#{day.month}/#{day.day}",
+    date_label: day.strftime("%A %-d %B"),
+    short_label: day.strftime("%a %-d"),
+    is_today: day == Date.today,
+    events: assign_columns(timed),
+    allday: parsed.select { |e| e[:allday] },
+  }
+end
+
+# Wat de bar toont. Een lopende afspraak gaat voor, daarna de eerstvolgende;
+# bij gelijke tijd wint de kalender met de hoogste prioriteit. Alleen relevant
+# voor vandaag: een dag terug of vooruit bladeren verandert de bar niet.
+def upcoming_from(timed, now)
+  live = timed.select { |e| e[:start_epoch] <= now.to_i && e[:end_epoch] > now.to_i }
+  ahead = timed.select { |e| e[:start_epoch] > now.to_i }
+  live.min_by { |e| [e[:priority], e[:start_epoch]] } ||
+    ahead.min_by { |e| [e[:start_epoch], e[:priority]] }
+end
+
+mode = ARGV[0] == "week" ? "week" : "day"
+offset = ARGV[1].to_s.start_with?("--") ? 0 : (ARGV[1] || 0).to_i
+now = Time.now
+
+# In weekmodus telt de offset in weken en begint de week op maandag, zoals in
+# Google Calendar.
+if mode == "week"
+  monday = Date.today - ((Date.today.wday + 6) % 7) + (offset * 7)
+  days = (0..6).map { |n| monday + n }
+else
+  days = [Date.today + offset]
+end
+
+rows = parse_rows(days.first, days.last)
+if rows.nil?
+  puts JSON.generate(ok: false, error: "gcalcli onbereikbaar", events: [], allday: [], days: [])
+  exit 0
+end
+
+built = days.map { |day| build_day(rows, day) }
+today = built.find { |d| d[:is_today] }
+
+# De bar gaat altijd over vandaag en over jouw eigen agenda; bladeren of in
+# andermans week kijken mag hem niet veranderen.
+upcoming = ONLY_CALENDAR.nil? && today ? upcoming_from(today[:events], now) : nil
+
+payload = {
+  ok: true,
+  mode: mode,
+  offset: offset,
+  only_calendar: ONLY_CALENDAR,
+  now: now.strftime("%H:%M"),
+  now_minutes: now.hour * 60 + now.min,
+  upcoming: upcoming,
+  days: built,
+}
+
+if mode == "week"
+  # De weekweergave van Google gebruikt de maandag als anker.
+  payload[:date_path] = built.first[:date_path]
+  payload[:date_label] = "#{days.first.strftime('%-d %b')} - #{days.last.strftime('%-d %b')}"
+  payload[:is_today] = offset.zero?
+else
+  payload.merge!(built.first.slice(:date_path, :date_label, :is_today, :events, :allday))
+end
+
+puts JSON.generate(payload)

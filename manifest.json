@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "jankeesvw.meetings",
+  "name": "Meetings",
+  "version": "1.0.0",
+  "author": "Jankees",
+  "description": "Today's agenda as a day column, with a now line",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Meetings",
+    "description": "Today's agenda as a day column, with a now line",
+    "category": "Apps",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
