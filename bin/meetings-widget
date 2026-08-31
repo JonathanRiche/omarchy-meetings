@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import sys
 from datetime import date, datetime, time, timedelta, timezone
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ARGV = sys.argv[1:]
@@ -467,7 +467,23 @@ def parse_google_rows(from_day, to_day):
     return [dict(zip(headers, line.split("\t"))) for line in lines[1:]]
 
 
+def graph_url_allowed(url):
+    """Never let an authenticated m365 request leave Microsoft Graph."""
+    try:
+        parsed = urlsplit(str(url))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (parsed.scheme == "https"
+            and parsed.hostname == "graph.microsoft.com"
+            and parsed.username is None
+            and parsed.password is None
+            and port in (None, 443))
+
+
 def graph_request(url, method=None, body=None, prefer=None):
+    if not graph_url_allowed(url):
+        return None
     command = ["m365", "request", "--url", url, "--output", "json"]
     if method:
         command.extend(["--method", method])
