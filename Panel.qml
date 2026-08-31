@@ -3,7 +3,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Today's agenda as a day column, the way Google Calendar draws it:
+// Today's agenda as a day column, the way a calendar draws it:
 // appointments in their place in time, a line for now, all-day events as bars
 // above it.
 //
@@ -138,7 +138,7 @@ Panel {
     if (safeUrl(detailEvent.hangout) !== "")
       out.push({ label: "Join the call", url: safeUrl(detailEvent.hangout) })
     if (safeUrl(detailEvent.link) !== "")
-      out.push({ label: "Open in Google Calendar", url: safeUrl(detailEvent.link) })
+      out.push({ label: "Open in " + calendarProviderLabel, url: safeUrl(detailEvent.link) })
     return out
   }
 
@@ -156,6 +156,9 @@ Panel {
   readonly property bool hasBorrowed: borrowedCalendar !== ""
   property string datePath: ""
   property string dateLabel: ""
+  property string calendarProvider: "google"
+  property string calendarProviderLabel: "Google Calendar"
+  property string agendaUrl: ""
 
   // The colour the old waybar module gave a meeting that is about to start. The
   // same colour draws the line for now: the theme accent is already spoken for
@@ -292,7 +295,7 @@ Panel {
     loading = true
   }
 
-  // The grid is there before gcalcli has said anything: the same days, the same
+  // The grid is there before the calendar CLI has said anything: the same days, the same
   // dates, only without appointments yet. A week that appears only once the data
   // lands feels slow, while the grid itself is already settled the moment you
   // flip the switch.
@@ -310,6 +313,8 @@ Panel {
         // Without leading zeroes, same as the script, because that is how
         // Google Calendar wants it in its url.
         date_path: d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate(),
+        calendar_url: calendarViewUrl(
+          d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate(), "day"),
         date_label: d.toLocaleDateString(locale, "dddd d MMMM"),
         short_label: d.toLocaleDateString(locale, "ddd d"),
         range_label: d.toLocaleDateString(locale, "d MMM"),
@@ -325,6 +330,7 @@ Panel {
     datePath = out[0].date_path
     dateLabel = weekView ? out[0].range_label + " - " + out[6].range_label
                          : out[0].date_label
+    agendaUrl = calendarViewUrl(datePath, weekView ? "week" : "day")
   }
 
   function refreshToday() {
@@ -423,6 +429,9 @@ Panel {
       nowMinutes = data.now_minutes || 0
       datePath = data.date_path || ""
       dateLabel = data.date_label || ""
+      calendarProvider = data.provider || "google"
+      calendarProviderLabel = data.provider_label || "Google Calendar"
+      agendaUrl = data.agenda_url || ""
       // Whose calendar can be borrowed lives in the config file, which only the
       // script reads, so it arrives with the agenda rather than separately.
       borrowedCalendar = (data.borrowed && data.borrowed.name) || ""
@@ -446,12 +455,9 @@ Panel {
 
   // The week view of the day you are looking at, when you are not pointing at
   // anything in particular.
-  // The links come from the calendar, so they are input. `bar.run` hands its
-  // string to a shell that splits it on whitespace, which makes one space in a
-  // link the difference between a URL and a second argument. So check the whole
-  // shape and refuse anything that does not match: a link that looks different
-  // means the source is saying something other than we think, not that there is
-  // something here to tidy up.
+  // The links come from the calendar, so they are input. Check the whole shape
+  // and launch it as one argv value: Outlook event URLs contain ampersands,
+  // which a shell command string would otherwise interpret as control syntax.
   function safeUrl(value) {
     var url = String(value || "")
     return /^https:\/\/[A-Za-z0-9.-]+\/[A-Za-z0-9._~:\/?#@!$&'()*+,;=%-]*$/.test(url) ? url : ""
@@ -464,21 +470,24 @@ Panel {
     return /^[0-9]{4}\/[0-9]{1,2}\/[0-9]{1,2}$/.test(path) ? path : ""
   }
 
-  function openAgenda() {
-    var path = safeDatePath(datePath)
-    if (!bar || path === "") return
-    close()
-    bar.run("omarchy-launch-webapp https://calendar.google.com/calendar/u/0/r/week/" + path)
+  function calendarViewUrl(path, mode) {
+    var view = mode === "day" ? "day" : "week"
+    if (calendarProvider === "microsoft")
+      return "https://outlook.office.com/calendar/view/" + view
+    var safePath = safeDatePath(path)
+    return safePath === "" ? "" :
+      "https://calendar.google.com/calendar/u/0/r/" + view + "/" + safePath
   }
 
-  // Opening a single day in Google Calendar. The week is already in front of
+  function openAgenda() {
+    openUrl(agendaUrl)
+  }
+
+  // Opening a single day in the configured calendar. The week is already in front of
   // you, so pointing at a day name means you want that day itself.
   function openDay(day) {
     if (!bar || !day) return
-    var path = safeDatePath(day.date_path)
-    if (path === "") return
-    close()
-    bar.run("omarchy-launch-webapp https://calendar.google.com/calendar/u/0/r/day/" + path)
+    openUrl(day.calendar_url)
   }
 
   // Opening one appointment. If there is a Meet link, that is the one you want:
@@ -561,22 +570,38 @@ Panel {
   property bool copiedPrompt: false
 
   readonly property string blockedTitle: {
+    if (blockedReason === "m365-missing") return "CLI for Microsoft 365 is not installed"
     if (blockedReason === "gcalcli-missing") return "gcalcli is not installed"
-    if (blockedReason === "not-authenticated") return "Not signed in to Google Calendar"
+    if (blockedReason === "not-authenticated") return "Not signed in to " + calendarProviderLabel
     return "Calendar unreachable"
   }
 
   readonly property string blockedHint: {
+    if (blockedReason === "m365-missing")
+      return "This widget reads Outlook through the m365 CLI.\nInstall @pnp/cli-microsoft365 with npm."
     if (blockedReason === "gcalcli-missing")
       return "This widget reads your calendar through gcalcli.\nInstall it with: yay -S gcalcli"
     if (blockedReason === "not-authenticated")
-      return "Run gcalcli init in a terminal.\nIt opens your browser once and stores a token."
-    return "gcalcli is installed and signed in, but returned nothing."
+      return calendarProvider === "microsoft"
+        ? "Run m365 setup, then m365 login in a terminal.\nThe Entra app needs delegated Calendars.Read permission."
+        : "Run gcalcli init in a terminal.\nIt opens your browser once and stores a token."
+    return calendarProvider === "microsoft"
+      ? "m365 is signed in, but Outlook returned nothing. Check Calendars.Read permission."
+      : "gcalcli is installed and signed in, but returned nothing."
   }
 
   // Wat je aan een agent geeft. Een opdracht en geen uitleg: het moet iets zijn
   // dat uitgevoerd kan worden zonder dat er nog iets nagevraagd hoeft te worden.
-  readonly property string setupPrompt:
+  readonly property string setupPrompt: calendarProvider === "microsoft" ?
+    "Set up the omarchy-meetings bar widget for Outlook Calendar on this Omarchy machine.\n\n" +
+    "1. Make sure Python, Node.js and npm are installed: omarchy pkg add python nodejs npm\n" +
+    "2. Install the CLI: npm install --global --prefix ~/.local @pnp/cli-microsoft365\n" +
+    "3. Run: m365 setup\n   Choose scripting and a minimal Entra public-client app.\n" +
+    "4. Give that app delegated Microsoft Graph Calendars.Read permission.\n" +
+    "5. Run: m365 login\n" +
+    "6. Confirm it worked: m365 status --output json\n\n" +
+    "Keep { \"provider\": \"microsoft\" } in ~/.config/omarchy-meetings/config.json. " +
+    "The widget calls Microsoft Graph through m365 and reuses its login; do not create another token." :
     "Set up the omarchy-meetings bar widget on this machine. It reads my Google Calendar " +
     "through gcalcli, and it is not working yet.\n\n" +
     "1. Install gcalcli if it is missing. On Arch or Omarchy: yay -S gcalcli\n" +
@@ -642,9 +667,9 @@ Panel {
 
   function openUrl(url) {
     var safe = safeUrl(url)
-    if (!bar || safe === "") return
+    if (safe === "") return
     close()
-    bar.run("omarchy-launch-webapp " + safe)
+    Util.execArgv(["omarchy-launch-webapp", safe])
   }
 
   function openEvent(event) {
@@ -1024,7 +1049,7 @@ Panel {
 
               PanelToolTip {
                 visible: dateMouse.containsMouse
-                text: "Open in Google Calendar"
+                text: "Open in " + root.calendarProviderLabel
                 fontFamily: root.fontFamily
               }
             }
@@ -1150,7 +1175,7 @@ Panel {
 
                 PanelToolTip {
                   visible: dayHeaderMouse.containsMouse
-                  text: dayHeader.modelData.date_label + "\nOpen in Google Calendar"
+                  text: dayHeader.modelData.date_label + "\nOpen in " + root.calendarProviderLabel
                   fontFamily: root.fontFamily
                 }
               }

@@ -8,8 +8,8 @@
     meetings-widget week -1         # last week
     meetings-widget week --demo     # a made-up week, no gcalcli needed
 
-Reads gcalcli's TSV: start_date, start_time, end_date, end_time, title,
-calendar. An empty time means an all-day event.
+Reads Google Calendar through gcalcli, or Outlook Calendar through the CLI for
+Microsoft 365. Both sources are normalized to the same rows before layout.
 
 Python rather than a shell script because the work here is dates, overlap and
 JSON, and rather than Ruby because gcalcli is itself a Python program: anyone
@@ -22,7 +22,9 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ARGV = sys.argv[1:]
 
@@ -51,6 +53,41 @@ def read_json(path, default):
 CONFIG = read_json(CONFIG_PATH, {})
 if not isinstance(CONFIG, dict):
     CONFIG = {}
+
+
+def provider_name(value):
+    name = str(value or "").strip().lower()
+    if name in ("microsoft", "microsoft365", "m365", "outlook"):
+        return "microsoft"
+    return "google"
+
+
+# Google stays the default, so existing installs need no config change. The
+# environment override is useful for trying the other adapter from a terminal.
+PROVIDER = provider_name(os.environ.get("MEETINGS_PROVIDER") or CONFIG.get("provider"))
+
+
+def local_timezone_name():
+    candidates = [os.environ.get("TZ")]
+    try:
+        zone_path = os.path.realpath("/etc/localtime")
+        marker = "/zoneinfo/"
+        if marker in zone_path:
+            candidates.append(zone_path.split(marker, 1)[1])
+    except OSError:
+        pass
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            ZoneInfo(candidate)
+            return candidate
+        except (ValueError, ZoneInfoNotFoundError):
+            continue
+    return "UTC"
+
+
+LOCAL_TIMEZONE = local_timezone_name()
 
 DEMO = ("--demo" in ARGV
         or os.environ.get("MEETINGS_DEMO") == "1"
@@ -81,8 +118,56 @@ VIEW = "day" if STATE.get("view") == "day" else "week"
 GCALCLI_OAUTH = home_path("XDG_DATA_HOME", ".local/share", "gcalcli", "oauth")
 
 
+def run_json(command):
+    """Run a non-interactive CLI command and decode its JSON answer."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+
+
+_m365_status = None
+_m365_status_checked = False
+
+
+def m365_status():
+    global _m365_status, _m365_status_checked
+    if not _m365_status_checked:
+        _m365_status = run_json(["m365", "status", "--output", "json"])
+        _m365_status_checked = True
+    return _m365_status
+
+
 def authenticated():
+    if PROVIDER == "microsoft":
+        status = m365_status()
+        return isinstance(status, dict) and bool(status.get("connectedAs"))
     return os.path.isfile(GCALCLI_OAUTH)
+
+
+def required_command():
+    return "m365" if PROVIDER == "microsoft" else "gcalcli"
+
+
+def provider_payload():
+    if PROVIDER == "microsoft":
+        return {
+            "provider": "microsoft",
+            "provider_label": "Outlook Calendar",
+            "agenda_url": "https://outlook.office.com/calendar/view/week",
+        }
+    return {
+        "provider": "google",
+        "provider_label": "Google Calendar",
+        "agenda_url": "",
+    }
 
 
 def private_dir(path):
@@ -329,9 +414,13 @@ def demo_rows(from_day, to_day):
                 "end_date": stamp, "end_time": end_time,
                 "title": title, "calendar": calendar,
                 "hangout_link": "",
-                "html_link": ("https://calendar.google.com/calendar/event?eid=demo"
+                "html_link": (("https://outlook.office.com/calendar/item/demo"
+                               if PROVIDER == "microsoft" else
+                               "https://calendar.google.com/calendar/event?eid=demo")
                               if title in DEMO_MEET else ""),
-                "conference_uri": ("https://meet.google.com/abc-defg-hij"
+                "conference_uri": (("https://teams.microsoft.com/l/meetup-join/demo"
+                                    if PROVIDER == "microsoft" else
+                                    "https://meet.google.com/abc-defg-hij")
                                    if title in DEMO_MEET else ""),
             })
             rows.append(row)
@@ -351,17 +440,12 @@ def demo_rows(from_day, to_day):
     return rows
 
 
-def parse_rows(from_day, to_day):
+def parse_google_rows(from_day, to_day):
     """Read the columns by name rather than by position: the order shifts with
     every --details that gets added, and then everything silently shifts along
     with it. Without an explicit range, gcalcli agenda starts at now, so
     yesterday simply does not exist and paging back gives an empty day. The
     range runs to the day after, because gcalcli treats the end as exclusive."""
-    if DEMO:
-        return demo_rows(from_day, to_day)
-    if not authenticated():
-        return None
-
     command = ["gcalcli", "agenda", "--tsv", "--nodeclined", "--details", "all",
                from_day.strftime("%Y-%m-%d"),
                (to_day + timedelta(days=1)).strftime("%Y-%m-%d")]
@@ -381,6 +465,178 @@ def parse_rows(from_day, to_day):
 
     headers = lines[0].split("\t")
     return [dict(zip(headers, line.split("\t"))) for line in lines[1:]]
+
+
+def graph_request(url, method=None, body=None, prefer=None):
+    command = ["m365", "request", "--url", url, "--output", "json"]
+    if method:
+        command.extend(["--method", method])
+    if body is not None:
+        command.extend(["--body", json.dumps(body), "--content-type", "application/json"])
+    if prefer:
+        command.extend(["--prefer", prefer])
+    return run_json(command)
+
+
+def graph_pages(url, prefer=None):
+    """Follow Graph pagination without ever handing a URL to a shell."""
+    items = []
+    next_url = url
+    for _ in range(50):
+        page = graph_request(next_url, prefer=prefer)
+        if not isinstance(page, dict) or not isinstance(page.get("value"), list):
+            return None
+        items.extend(page["value"])
+        next_url = page.get("@odata.nextLink")
+        if not next_url:
+            return items
+    return None
+
+
+def graph_datetime(value):
+    """Turn Graph's default UTC dateTimeTimeZone into local wall time."""
+    if not isinstance(value, dict):
+        return None
+    raw = str(value.get("dateTime") or "")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        zone_name = str(value.get("timeZone") or "UTC")
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(zone_name))
+        except (ValueError, ZoneInfoNotFoundError):
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone()
+
+
+def microsoft_row(event, calendar_name):
+    if (not isinstance(event, dict) or event.get("isCancelled")
+            or (event.get("responseStatus") or {}).get("response") == "declined"):
+        return None
+    title = str(event.get("subject") or "")
+    starts = graph_datetime(event.get("start"))
+    ends = graph_datetime(event.get("end"))
+    if not title or starts is None or ends is None:
+        return None
+
+    all_day = event.get("isAllDay") is True
+    if all_day:
+        # All-day values describe calendar dates. Converting their midnight
+        # through UTC can move them to yesterday in a western timezone.
+        start_date = str((event.get("start") or {}).get("dateTime") or "")[:10]
+        end_date = str((event.get("end") or {}).get("dateTime") or "")[:10]
+        start_time = end_time = ""
+    else:
+        start_date, start_time = starts.strftime("%Y-%m-%d"), starts.strftime("%H:%M")
+        end_date, end_time = ends.strftime("%Y-%m-%d"), ends.strftime("%H:%M")
+
+    location = event.get("location") or {}
+    organizer = (event.get("organizer") or {}).get("emailAddress") or {}
+    meeting = event.get("onlineMeeting") or {}
+    return {
+        "id": str(event.get("id") or ""),
+        "start_date": start_date,
+        "start_time": start_time,
+        "end_date": end_date,
+        "end_time": end_time,
+        "title": title,
+        "calendar": calendar_name,
+        "html_link": str(event.get("webLink") or ""),
+        "conference_uri": str(meeting.get("joinUrl") or event.get("onlineMeetingUrl") or ""),
+        "location": str(location.get("displayName") or ""),
+        "description": str(event.get("bodyPreview") or ""),
+        "email": str(organizer.get("address") or ""),
+    }
+
+
+def local_range(from_day, to_day):
+    starts = datetime.combine(from_day, time.min).astimezone()
+    ends = datetime.combine(to_day + timedelta(days=1), time.min).astimezone()
+    return starts.isoformat(), ends.isoformat()
+
+
+def parse_microsoft_rows(from_day, to_day):
+    records = cached_calendar_records()
+    if records is None:
+        return None
+
+    wanted = []
+    for record in records:
+        name = record["name"]
+        if ONLY_CALENDAR and name != ONLY_CALENDAR:
+            continue
+        if not ONLY_CALENDAR and VISIBLE is not None and name not in VISIBLE:
+            continue
+        if not ONLY_CALENDAR and VISIBLE is None and name in SKIP_CALENDARS:
+            continue
+        wanted.append(record)
+
+    range_start, range_end = local_range(from_day, to_day)
+    properties = ("id,subject,start,end,isAllDay,isCancelled,webLink,"
+                  "onlineMeeting,onlineMeetingUrl,location,bodyPreview,organizer,"
+                  "responseStatus")
+    rows = []
+    # Graph batching keeps a refresh to one m365 process for up to twenty
+    # calendars instead of starting the Node CLI once per calendar.
+    for batch_start in range(0, len(wanted), 20):
+        batch_records = wanted[batch_start:batch_start + 20]
+        requests = []
+        record_by_id = {}
+        for index, record in enumerate(batch_records):
+            request_id = str(index + 1)
+            record_by_id[request_id] = record
+            calendar_id = quote(record["id"], safe="")
+            query = urlencode({
+                "startDateTime": range_start,
+                "endDateTime": range_end,
+                "$select": properties,
+                "$top": "1000",
+            })
+            requests.append({
+                "id": request_id,
+                "method": "GET",
+                "url": "/me/calendars/%s/calendarView?%s" % (calendar_id, query),
+                "headers": {"Prefer": 'outlook.timezone="%s"' % LOCAL_TIMEZONE},
+            })
+
+        batch = graph_request("https://graph.microsoft.com/v1.0/$batch",
+                              method="post", body={"requests": requests})
+        if not isinstance(batch, dict) or not isinstance(batch.get("responses"), list):
+            return None
+        responses = {str(response.get("id")): response for response in batch["responses"]
+                     if isinstance(response, dict)}
+        for request_id, record in record_by_id.items():
+            response = responses.get(request_id) or {}
+            body = response.get("body") or {}
+            if response.get("status") != 200 or not isinstance(body.get("value"), list):
+                return None
+            events = list(body["value"])
+            next_url = body.get("@odata.nextLink")
+            if next_url:
+                following = graph_pages(
+                    next_url, prefer='outlook.timezone="%s"' % LOCAL_TIMEZONE)
+                if following is None:
+                    return None
+                events.extend(following)
+            rows.extend(row for row in (microsoft_row(event, record["name"])
+                                        for event in events) if row)
+    return rows
+
+
+def parse_rows(from_day, to_day):
+    if DEMO:
+        return demo_rows(from_day, to_day)
+    if PROVIDER == "microsoft":
+        if shutil.which("m365") is None:
+            return None
+        return parse_microsoft_rows(from_day, to_day)
+    if not authenticated():
+        return None
+    return parse_google_rows(from_day, to_day)
 
 
 def parse_attendees(value):
@@ -534,6 +790,13 @@ def assign_columns(events):
     return events
 
 
+def calendar_url(day, mode):
+    if PROVIDER == "microsoft":
+        return "https://outlook.office.com/calendar/view/%s" % mode
+    path = "%d/%d/%d" % (day.year, day.month, day.day)
+    return "https://calendar.google.com/calendar/u/0/r/%s/%s" % (mode, path)
+
+
 def build_day(rows, day):
     """One day, assembled from the rows of the whole requested range."""
     parsed = [event for event in (event_from(row, day) for row in rows) if event]
@@ -556,6 +819,7 @@ def build_day(rows, day):
         # Without leading zeroes, because that is how Google Calendar wants it
         # in its url.
         "date_path": "%d/%d/%d" % (day.year, day.month, day.day),
+        "calendar_url": calendar_url(day, "day"),
         "date_label": day.strftime("%A %-d %B"),
         "short_label": day.strftime("%a %-d"),
         "is_today": day == date.today(),
@@ -593,14 +857,9 @@ DEMO_CALENDAR_NAMES = ["Work", "Personal", "Shared"]
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
-def fetch_calendars():
+def fetch_google_calendars():
     """gcalcli prints a table: a header, a rule of dashes, then one row per
     calendar with the access level first and the title filling the rest."""
-    if DEMO:
-        return list(DEMO_CALENDAR_NAMES)
-    if not authenticated():
-        return None
-
     try:
         result = subprocess.run(["gcalcli", "list"], capture_output=True, text=True,
                                 stdin=subprocess.DEVNULL)
@@ -619,27 +878,111 @@ def fetch_calendars():
         if title == "Title" or re.match(r"\A-+\Z", title):
             continue
         names.append(title)
-    return names
+    return [{"id": title, "name": title} for title in names]
 
 
-def cached_calendars():
+def fetch_microsoft_calendars():
+    query = urlencode({"$select": "id,name", "$top": "1000"})
+    items = graph_pages("https://graph.microsoft.com/v1.0/me/calendars?" + query)
+    if items is None:
+        return None
+    records = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        calendar_id = str(entry.get("id") or "")
+        name = str(entry.get("name") or "")
+        if calendar_id and name:
+            records.append({"id": calendar_id, "name": name})
+    return records
+
+
+def fetch_calendar_records():
+    if DEMO:
+        return [{"id": name, "name": name} for name in DEMO_CALENDAR_NAMES]
+    if PROVIDER == "microsoft":
+        return fetch_microsoft_calendars()
+    if not authenticated():
+        return None
+    return fetch_google_calendars()
+
+
+def cached_calendar_records():
     """A cache must never be the thing that breaks the script, so anything that
     is not the shape we wrote is treated as no cache at all."""
     try:
         if (os.path.isfile(CACHE_PATH) and not os.path.islink(CACHE_PATH)
                 and (datetime.now().timestamp() - os.path.getmtime(CACHE_PATH)) < CACHE_MAX_AGE):
             parsed = read_json(CACHE_PATH, None)
-            if isinstance(parsed, list) and parsed:
-                return [str(name) for name in parsed]
+            if (isinstance(parsed, dict) and parsed.get("provider") == PROVIDER
+                    and isinstance(parsed.get("calendars"), list)):
+                records = []
+                for entry in parsed["calendars"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    calendar_id = str(entry.get("id") or "")
+                    name = str(entry.get("name") or "")
+                    if calendar_id and name:
+                        records.append({"id": calendar_id, "name": name})
+                if records:
+                    return records
     except OSError:
-        pass  # fall through and ask gcalcli again
+        pass  # fall through and ask the provider again
 
-    fresh = fetch_calendars()
+    fresh = fetch_calendar_records()
+    if fresh is None:
+        return None
     if not fresh:
         return []
 
-    write_private(CACHE_PATH, json.dumps(fresh))
+    write_private(CACHE_PATH, json.dumps({"provider": PROVIDER, "calendars": fresh}))
     return fresh
+
+
+def cached_calendars():
+    records = cached_calendar_records()
+    return [record["name"] for record in records] if records is not None else []
+
+
+MICROSOFT_STATUSES = {
+    "accepted": "accepted",
+    "declined": "declined",
+    "tentativelyAccepted": "tentative",
+    "organizer": "accepted",
+    "none": "needsAction",
+    "notResponded": "needsAction",
+}
+
+
+def microsoft_attendees(calendar_name, event_id):
+    records = cached_calendar_records() or []
+    record = next((entry for entry in records if entry["name"] == calendar_name), None)
+    if record is None:
+        return []
+    calendar_id = quote(record["id"], safe="")
+    encoded_event = quote(event_id, safe="")
+    query = urlencode({"$select": "attendees"})
+    url = ("https://graph.microsoft.com/v1.0/me/calendars/%s/events/%s?%s" %
+           (calendar_id, encoded_event, query))
+    event = graph_request(url)
+    if not isinstance(event, dict):
+        return []
+
+    people = []
+    for attendee in event.get("attendees") or []:
+        if not isinstance(attendee, dict):
+            continue
+        address = attendee.get("emailAddress") or {}
+        name = str(address.get("name") or address.get("address") or "")
+        if not name:
+            continue
+        response = str((attendee.get("status") or {}).get("response") or "")
+        people.append({
+            "name": name,
+            "email": str(address.get("address") or ""),
+            "status": MICROSOFT_STATUSES.get(response, response),
+        })
+    return people
 
 
 def dump(payload):
@@ -671,6 +1014,10 @@ def main():
 
         if not event_id or not calendar_name:
             dump([])
+            return 0
+
+        if PROVIDER == "microsoft":
+            dump(microsoft_attendees(calendar_name, event_id))
             return 0
 
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetings-attendees")
@@ -724,11 +1071,17 @@ def main():
     if rows is None:
         # Two different problems that need two different answers: one is fixed
         # by installing something, the other by logging in.
-        missing = shutil.which("gcalcli") is None
-        dump({"ok": False,
-              "error": "gcalcli-missing" if missing else
-                       ("not-authenticated" if not authenticated() else "gcalcli-failed"),
-              "events": [], "allday": [], "days": []})
+        command_name = required_command()
+        missing = shutil.which(command_name) is None
+        payload = provider_payload()
+        payload.update({
+            "ok": False,
+            "error": "%s-missing" % command_name if missing else
+                     ("not-authenticated" if not authenticated() else
+                      "%s-failed" % command_name),
+            "events": [], "allday": [], "days": [],
+        })
+        dump(payload)
         return 0
 
     built = [build_day(rows, day) for day in days]
@@ -764,6 +1117,7 @@ def main():
         "upcoming": upcoming,
         "days": built,
     }
+    payload.update(provider_payload())
 
     if mode == "week":
         # Google's week view uses the Monday as its anchor.
@@ -771,9 +1125,11 @@ def main():
         payload["date_label"] = "%s - %s" % (days[0].strftime("%-d %b"),
                                              days[-1].strftime("%-d %b"))
         payload["is_today"] = offset == 0
+        payload["agenda_url"] = calendar_url(days[0], "week")
     else:
         for key in ("date_path", "date_label", "is_today", "events", "allday"):
             payload[key] = built[0][key]
+        payload["agenda_url"] = calendar_url(days[0], "day")
 
     dump(payload)
     return 0
