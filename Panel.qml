@@ -594,12 +594,11 @@ Panel {
   // dat uitgevoerd kan worden zonder dat er nog iets nagevraagd hoeft te worden.
   readonly property string setupPrompt: calendarProvider === "microsoft" ?
     "Set up the omarchy-meetings bar widget for Outlook Calendar on this Omarchy machine.\n\n" +
-    "1. Make sure Python, Node.js and npm are installed: omarchy pkg add python nodejs npm\n" +
-    "2. Install the CLI: npm i -g @pnp/cli-microsoft365\n" +
-    "3. Run: m365 setup\n   Choose scripting and a minimal Entra public-client app.\n" +
-    "4. Give that app delegated Microsoft Graph Calendars.Read permission.\n" +
-    "5. Run: m365 login\n" +
-    "6. Confirm it worked: m365 status --output json\n\n" +
+    "1. Install the CLI: npm i -g @pnp/cli-microsoft365\n" +
+    "2. Run: m365 setup\n   Choose scripting and the minimal User.Read permission.\n" +
+    "3. In Microsoft Entra, add delegated Microsoft Graph Calendars.Read permission to that app.\n" +
+    "4. Run: m365 login\n" +
+    "5. Confirm it worked: m365 status --output json\n\n" +
     "Keep { \"provider\": \"microsoft\" } in ~/.config/omarchy-meetings/config.json. " +
     "The widget calls Microsoft Graph through m365 and reuses its login; do not create another token." :
     "Set up the omarchy-meetings bar widget on this machine. It reads my Google Calendar " +

@@ -41,32 +41,32 @@ gcalcli list     # should now print your calendars
 
 `init` stores a token in `~/.local/share/gcalcli`. There is nothing to log into separately: this plugin runs gcalcli, and the attendee lookup borrows that same token. If you would rather use your own Google Cloud OAuth client, pass `--client-id` and `--client-secret` to `gcalcli init` and the rest works the same.
 
-## Outlook Calendar and Microsoft Teams
+## Outlook and Microsoft Teams
 
-Set the provider in `~/.config/omarchy-meetings/config.json`:
+Outlook works through [CLI for Microsoft 365](https://pnp.github.io/cli-microsoft365/). Install it and set the provider in `~/.config/omarchy-meetings/config.json`:
+
+```bash
+npm i -g @pnp/cli-microsoft365
+```
 
 ```json
 { "provider": "microsoft" }
 ```
 
-Outlook uses the cross-platform [CLI for Microsoft 365](https://pnp.github.io/cli-microsoft365/). It is distributed through npm rather than the AUR:
-
-```bash
-omarchy pkg add python nodejs npm
-npm i -g @pnp/cli-microsoft365
-```
-
-The CLI authenticates through a Microsoft Entra public-client app. Run its setup wizard and choose scripting use. For least privilege, create the app with the minimal `User.Read` scope, then add delegated Microsoft Graph `Calendars.Read`; or select an existing public-client app that already has those permissions. Then sign in:
+Set up the CLI with the minimal `User.Read` permission and choose scripting use:
 
 ```bash
 m365 setup
+```
+
+In Microsoft Entra, add the delegated Microsoft Graph permission `Calendars.Read` to the app that `setup` created. Some work accounts need an administrator to approve it. Then sign in:
+
+```bash
 m365 login
 m365 status --output json
 ```
 
-Some work or school tenants require an administrator to create the app, grant `Calendars.Read`, or approve user consent. In that case, use the client and tenant IDs they provide when configuring the CLI.
-
-The widget uses that same `m365` login to read Graph's calendar view. Recurring appointments are expanded, Outlook event links open directly, and `onlineMeeting.joinUrl` becomes the join button for Teams meetings. Attendees are fetched only when you open an appointment, just like with Google.
+The widget uses that login for Outlook. Teams links become the join button, and attendees are fetched only when you open an appointment.
 
 The button in that panel copies a set of instructions to your clipboard, written to be handed straight to a coding agent if you would rather not do it yourself.
 
@@ -88,7 +88,7 @@ With Google, attendees do not come out of gcalcli's output, so they are fetched 
 
 **How much room a gap really is.** Move the mouse into the space between two appointments and it hatches, with the span named in the middle. If that gap is running right now, it counts from this minute rather than from the end of the last meeting, because the part that has already passed is not time you still have.
 
-**Which calendars you see.** The picker at the bottom lists your calendars by the names Google gives them. Untick the one full of other people's birthdays and it is gone from the grid, this week and every week after, until you tick it back.
+**Which calendars you see.** The picker at the bottom lists your calendars by name. Untick the one full of other people's birthdays and it is gone from the grid, this week and every week after, until you tick it back.
 
 **Everything from the keyboard.** Tab walks the switch, every appointment and the controls at the bottom. Arrows move between appointments and left and right page through days or weeks. Enter opens what you are on, Escape steps back out.
 
