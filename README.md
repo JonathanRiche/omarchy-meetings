@@ -70,6 +70,8 @@ The widget uses that login for Outlook. Teams links become the join button, and 
 
 The button in that panel copies a set of instructions to your clipboard, written to be handed straight to a coding agent if you would rather not do it yourself.
 
+![Outlook Calendar in the week view](screenshots/microsoft.png)
+
 ## What you get
 
 **The week, or one day.** The switch in the header decides, and it remembers what you picked. The day view narrows the panel to a single column and puts the start time in front of every appointment.
