@@ -53,7 +53,7 @@ Outlook uses the cross-platform [CLI for Microsoft 365](https://pnp.github.io/cl
 
 ```bash
 omarchy pkg add python nodejs npm
-npm install --global --prefix ~/.local @pnp/cli-microsoft365
+npm i -g @pnp/cli-microsoft365
 ```
 
 The CLI authenticates through a Microsoft Entra public-client app. Run its setup wizard and choose scripting use. For least privilege, create the app with the minimal `User.Read` scope, then add delegated Microsoft Graph `Calendars.Read`; or select an existing public-client app that already has those permissions. Then sign in:

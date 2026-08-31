@@ -595,7 +595,7 @@ Panel {
   readonly property string setupPrompt: calendarProvider === "microsoft" ?
     "Set up the omarchy-meetings bar widget for Outlook Calendar on this Omarchy machine.\n\n" +
     "1. Make sure Python, Node.js and npm are installed: omarchy pkg add python nodejs npm\n" +
-    "2. Install the CLI: npm install --global --prefix ~/.local @pnp/cli-microsoft365\n" +
+    "2. Install the CLI: npm i -g @pnp/cli-microsoft365\n" +
     "3. Run: m365 setup\n   Choose scripting and a minimal Entra public-client app.\n" +
     "4. Give that app delegated Microsoft Graph Calendars.Read permission.\n" +
     "5. Run: m365 login\n" +
