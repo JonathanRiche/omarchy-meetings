@@ -1,259 +1,783 @@
-#!/usr/bin/env ruby
-# frozen_string_literal: true
+#!/usr/bin/env python3
+"""meetings-widget: the day's agenda as JSON for the bar widget.
 
-# meetings-widget — agenda als JSON voor de bar-widget.
+    meetings-widget day             # today
+    meetings-widget day 1           # tomorrow, -1 is yesterday
+    meetings-widget day 0 --only "Someone Else"   # that one calendar only
+    meetings-widget week            # this week, Monday through Sunday
+    meetings-widget week -1         # last week
+    meetings-widget week --demo     # a made-up week, no gcalcli needed
+
+Reads gcalcli's TSV: start_date, start_time, end_date, end_time, title,
+calendar. An empty time means an all-day event.
+
+Python rather than a shell script because the work here is dates, overlap and
+JSON, and rather than Ruby because gcalcli is itself a Python program: anyone
+who can run this plugin already has the interpreter it needs.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+
+ARGV = sys.argv[1:]
+
+
+def home_path(env_name, fallback, *parts):
+    base = os.environ.get(env_name) or os.path.join(os.path.expanduser("~"), fallback)
+    return os.path.join(base, *parts)
+
+
+# Which calendar gets which colour is personal, so it lives in a config file
+# instead of in here. A bar plugin cannot count on the environment reaching it,
+# so a file is the only thing it can rely on; the env vars stay behind as an
+# override for running this from a shell.
+CONFIG_PATH = os.environ.get("MEETINGS_CONFIG") or home_path(
+    "XDG_CONFIG_HOME", ".config", "omarchy-meetings", "config.json")
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+CONFIG = read_json(CONFIG_PATH, {})
+if not isinstance(CONFIG, dict):
+    CONFIG = {}
+
+DEMO = ("--demo" in ARGV
+        or os.environ.get("MEETINGS_DEMO") == "1"
+        or CONFIG.get("demo") is True)
+
+# What the panel remembers between openings: which calendars are ticked and
+# whether you left it on the week or the day. It sits next to the config rather
+# than in it, because this file is rewritten from the panel and rewriting the
+# config would throw away whatever the reader put in there by hand.
+STATE_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "state.json")
+
+STATE = read_json(STATE_PATH, {})
+if not isinstance(STATE, dict):
+    STATE = {}
+
+# Absent means everything is shown, which is what a fresh install should do.
+_visible = STATE.get("visibleCalendars")
+VISIBLE = [str(name) for name in _visible] if isinstance(_visible, list) and _visible else None
+
+# The week is the default: it says more at a glance, and it is what you get
+# before you have ever chosen otherwise.
+VIEW = "day" if STATE.get("view") == "day" else "week"
+
+
+# gcalcli stores its token here, and without one it starts an interactive auth
+# flow of its own. A bar widget that refreshes every minute must never do that,
+# so the token is checked before gcalcli is called at all.
+GCALCLI_OAUTH = home_path("XDG_DATA_HOME", ".local/share", "gcalcli", "oauth")
+
+
+def authenticated():
+    return os.path.isfile(GCALCLI_OAUTH)
+
+
+def private_dir(path):
+    """The directory holds what your days look like, so it is nobody else's to
+    read. makedirs follows a symlink and reports success, so check the path."""
+    try:
+        if not os.path.isdir(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        if os.path.islink(path):
+            return False
+        if os.stat(path).st_uid != os.getuid():
+            return False
+        os.chmod(path, 0o700)
+        return True
+    except OSError:
+        return False
+
+
+def write_private(path, content):
+    """rename replaces the path, where `>` would follow a symlink sitting on it."""
+    directory = os.path.dirname(path)
+    if not private_dir(directory):
+        return False
+
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(handle, "w") as out:
+            out.write(content)
+        os.rename(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+_skip_env = os.environ.get("MEETINGS_SKIP_CALENDARS")
+SKIP_CALENDARS = [name.strip() for name in (
+    _skip_env.split(",") if _skip_env is not None else (CONFIG.get("skipCalendars") or []))]
+
+# --only turns the filter around: that one calendar becomes the only thing that
+# counts. Meant for glancing at someone else's day without your own agenda in
+# between, so the skip list does not apply.
+ONLY_CALENDAR = None
+if "--only" in ARGV:
+    _index = ARGV.index("--only")
+    if _index + 1 < len(ARGV):
+        ONLY_CALENDAR = ARGV[_index + 1]
+
+SKIP_TITLES = CONFIG.get("skipTitles") or []
+
+# Colour and order per calendar. Priority decides which appointment the bar
+# picks when two run at once: the lower number wins.
 #
-#   meetings-widget day             # vandaag
-#   meetings-widget day 1           # morgen, -1 is gisteren
-#   meetings-widget day 0 --only "Paul - WBSO.ai"   # alleen die agenda
-#   meetings-widget week            # deze week, maandag tot en met zondag
-#   meetings-widget week -1         # vorige week
+# The default is a single neutral grey, because a calendar named after someone
+# else's company means nothing here. Name your own in the config file:
 #
-# Leest gcalcli's TSV: start_date, start_time, end_date, end_time, title,
-# calendar. Een lege tijd betekent een dag-event.
+#   { "calendars": [ { "match": "Work", "color": "#4a9eff", "priority": 1 } ] }
 #
-# De regels hieronder komen uit het waybar-script dat hieraan voorafging
-# (meetings-list.sh); die keuzes waren doordacht en zijn hier overgenomen in
-# plaats van opnieuw verzonnen.
+# `match` is a regular expression, tried in order against the calendar name.
+DEFAULT_STYLE = {"color": "#9aa0a6", "priority": 4}
 
-require "json"
-require "time"
-require "date"
+CALENDAR_STYLES = []
+for entry in (CONFIG.get("calendars") or []):
+    try:
+        CALENDAR_STYLES.append({
+            "match": re.compile(str(entry.get("match", ""))),
+            "color": entry.get("color") or DEFAULT_STYLE["color"],
+            "priority": entry.get("priority") or DEFAULT_STYLE["priority"],
+        })
+    except re.error:
+        continue
 
-SKIP_CALENDARS = (ENV["MEETINGS_SKIP_CALENDARS"] || "Paul - WBSO.ai,Marjolein").split(",").map(&:strip)
-
-# Met --only draait het filter om: dan is die ene agenda juist het enige dat
-# telt. Bedoeld om even in andermans dag te kijken zonder je eigen agenda
-# ertussen, dus zonder de overslaan-lijst.
-ONLY_CALENDAR = begin
-  index = ARGV.index("--only")
-  index ? ARGV[index + 1] : nil
-end
-SKIP_TITLES = ["Afwezig", "Geen geplande meetings"].freeze
-
-# Kleur en volgorde per kalender. De oude module zette hier een emoji-blokje
-# voor; dit zijn dezelfde groepen, nu als kleur die de widget kan tekenen.
-# Prioriteit bepaalt welke afspraak de bar haalt als er twee tegelijk lopen:
-# werk gaat voor, privé komt daarna.
-CALENDAR_STYLES = [
-  { match: /WBSO/,                   color: "#4a9eff", priority: 1 },
-  { match: /\A(Jankees|Zakelijk)\z/, color: "#ff5c5c", priority: 2 },
-  { match: /Gezamenlijk/,            color: "#f5c518", priority: 3 },
-].freeze
-
-DEFAULT_STYLE = { color: "#9aa0a6", priority: 4 }.freeze
-
-# Andermans agenda krijgt geen eigen kleur maar het neutrale grijs. Zijn
-# WBSO-afspraken zouden anders hetzelfde blauw krijgen als die van jou, en dan
-# lijkt het je eigen dag; zwart viel juist zo ver weg dat de blokken niet meer
-# te zien waren.
-BORROWED_STYLE = { color: "#9aa0a6", priority: 4 }.freeze
-
-def style_for(calendar)
-  return BORROWED_STYLE if ONLY_CALENDAR
-
-  CALENDAR_STYLES.find { |s| s[:match].match?(calendar.to_s) } || DEFAULT_STYLE
-end
-
-# Kolommen op naam lezen in plaats van op positie: de volgorde verschuift met
-# elke --details die erbij komt, en dan verschuift alles stilzwijgend mee.
-# Zonder expliciet bereik begint gcalcli agenda bij nu, dus bestaat gisteren
-# domweg niet en levert terugbladeren een lege dag op. Het bereik loopt tot de
-# dag erna, want gcalcli hanteert een exclusief einde.
-def parse_rows(from_day, to_day)
-  from = from_day.strftime("%Y-%m-%d")
-  to = (to_day + 1).strftime("%Y-%m-%d")
-  raw = `gcalcli agenda --tsv --nodeclined --details calendar --details id --details url #{from} #{to} 2>/dev/null`
-  return nil unless $?.success?
-
-  lines = raw.lines
-  return [] if lines.empty?
-
-  headers = lines.first.chomp.split("\t")
-  lines.drop(1).map do |line|
-    headers.zip(line.chomp.split("\t")).to_h
-  end
-end
-
-def event_from(row, day)
-  start_date = row["start_date"]
-  start_time = row["start_time"]
-  end_date = row["end_date"]
-  end_time = row["end_time"]
-  title = row["title"]
-  calendar = row["calendar"]
-
-  # html_link bevat de eid die Google zelf gebruikt, dus die hoeven we niet na
-  # te bouwen uit event- en agenda-id.
-  link = row["html_link"].to_s
-  hangout = row["hangout_link"].to_s
-  return nil if title.nil? || title.empty?
-  return nil if SKIP_TITLES.include?(title)
-
-  if ONLY_CALENDAR
-    return nil unless calendar.to_s == ONLY_CALENDAR
-  elsif SKIP_CALENDARS.include?(calendar)
-    return nil
-  end
-
-  style = style_for(calendar)
-
-  # Dag-events hebben geen tijd en lopen vaak over meerdere dagen. gcalcli
-  # geeft de einddatum exclusief, net als de Google-API zelf.
-  if start_time.nil? || start_time.empty?
-    first = Date.parse(start_date)
-    last = Date.parse(end_date) - 1
-    return nil unless (first..last).cover?(day)
-
-    return {
-      allday: true, title: title, calendar: calendar,
-      color: style[:color], priority: style[:priority],
-      multiday: first != last,
-      link: link,
+# One colleague's calendar you can flip to, to see their day instead of your
+# own. Without one configured the panel leaves the toggle out entirely.
+#
+#   { "borrowedCalendar": { "name": "Sam - Work", "label": "Sam's calendar" } }
+BORROWED_CALENDAR = None
+_borrowed = CONFIG.get("borrowedCalendar")
+if isinstance(_borrowed, dict) and str(_borrowed.get("name") or ""):
+    BORROWED_CALENDAR = {
+        "name": _borrowed["name"],
+        "label": _borrowed.get("label") or _borrowed["name"],
     }
-  end
 
-  starts = Time.parse("#{start_date} #{start_time}")
-  ends = Time.parse("#{end_date} #{end_time}")
-  return nil unless starts.to_date == day
+# Someone else's agenda gets the neutral grey rather than a colour of its own.
+# Their work appointments would otherwise get the same blue as yours, and then
+# it reads as your own day; black fell so far back that the blocks stopped
+# being visible at all.
+BORROWED_STYLE = {"color": "#9aa0a6", "priority": 4}
 
-  {
-    allday: false,
-    title: title,
-    calendar: calendar,
-    color: style[:color],
-    priority: style[:priority],
-    start: starts.strftime("%H:%M"),
-    end: ends.strftime("%H:%M"),
-    start_minutes: starts.hour * 60 + starts.min,
-    end_minutes: ends.hour * 60 + ends.min,
-    start_epoch: starts.to_i,
-    end_epoch: ends.to_i,
-    link: link,
-    hangout: hangout,
-  }
-end
 
-# Overlappende afspraken naast elkaar, zoals een agenda dat doet. Zonder dit
-# tekenen ze over elkaar heen en verdwijnt alles wat binnen een lange afspraak
-# valt: een samenwerkdag van 09:00 tot 18:00 slokt dan de vier overleggen op
-# die erin zitten.
-#
-# Eerst clusteren op overlap, dan binnen een cluster de eerste kolom pakken die
-# vrij is. Elk event krijgt zijn kolom en het totaal van dat cluster mee, zodat
-# de widget alleen nog hoeft te delen.
-def assign_columns(events)
-  cluster = []
-  cluster_end = nil
+def style_for(calendar):
+    if ONLY_CALENDAR:
+        return BORROWED_STYLE
 
-  flush = lambda do
-    columns = []
-    cluster.each do |event|
-      slot = columns.index { |free_at| free_at <= event[:start_minutes] }
-      if slot.nil?
-        columns << event[:end_minutes]
-        slot = columns.length - 1
-      else
-        columns[slot] = event[:end_minutes]
-      end
-      event[:column] = slot
-    end
-    cluster.each { |event| event[:columns] = columns.length }
-    cluster = []
-  end
+    # Without a config the demo would be three shades of the same grey, which
+    # says nothing about what the colours are for.
+    styles = DEMO_CALENDARS if (not CALENDAR_STYLES and DEMO) else CALENDAR_STYLES
+    for style in styles:
+        if style["match"].search(str(calendar or "")):
+            return style
+    return DEFAULT_STYLE
 
-  events.each do |event|
-    if cluster_end.nil? || event[:start_minutes] < cluster_end
-      cluster << event
-      cluster_end = [cluster_end || 0, event[:end_minutes]].max
-    else
-      flush.call
-      cluster << event
-      cluster_end = event[:end_minutes]
-    end
-  end
-  flush.call
 
-  events
-end
+# A made-up week, so the widget can be tried, screenshotted and tested without
+# a Google account behind it. The days are keyed by weekday, so whichever week
+# you land on looks the same, and every day has something around midday for the
+# now line to cut through.
+DEMO_CALENDARS = [
+    {"match": re.compile(r"\AWork\Z"), "color": "#4a9eff", "priority": 1},
+    {"match": re.compile(r"\APersonal\Z"), "color": "#ff5c5c", "priority": 2},
+    {"match": re.compile(r"\AShared\Z"), "color": "#f5c518", "priority": 3},
+]
 
-# Eén dag samenstellen uit de rijen van het hele opgevraagde bereik.
-def build_day(rows, day)
-  parsed = rows.filter_map { |row| event_from(row, day) }
-
-  # Ontdubbelen op titel plus starttijd: dezelfde afspraak staat vaak in twee
-  # agenda's die je allebei ziet.
-  seen = {}
-  timed = parsed.reject { |e| e[:allday] }.reject do |e|
-    key = "#{e[:title]}|#{e[:start_epoch]}"
-    seen.key?(key).tap { seen[key] = true }
-  end.sort_by { |e| e[:start_minutes] }
-
-  {
-    # Zonder leidende nullen, want zo wil Google Calendar het in zijn url.
-    date_path: "#{day.year}/#{day.month}/#{day.day}",
-    date_label: day.strftime("%A %-d %B"),
-    short_label: day.strftime("%a %-d"),
-    is_today: day == Date.today,
-    events: assign_columns(timed),
-    allday: parsed.select { |e| e[:allday] },
-  }
-end
-
-# Wat de bar toont. Een lopende afspraak gaat voor, daarna de eerstvolgende;
-# bij gelijke tijd wint de kalender met de hoogste prioriteit. Alleen relevant
-# voor vandaag: een dag terug of vooruit bladeren verandert de bar niet.
-def upcoming_from(timed, now)
-  live = timed.select { |e| e[:start_epoch] <= now.to_i && e[:end_epoch] > now.to_i }
-  ahead = timed.select { |e| e[:start_epoch] > now.to_i }
-  live.min_by { |e| [e[:priority], e[:start_epoch]] } ||
-    ahead.min_by { |e| [e[:start_epoch], e[:priority]] }
-end
-
-mode = ARGV[0] == "week" ? "week" : "day"
-offset = ARGV[1].to_s.start_with?("--") ? 0 : (ARGV[1] || 0).to_i
-now = Time.now
-
-# In weekmodus telt de offset in weken en begint de week op maandag, zoals in
-# Google Calendar.
-if mode == "week"
-  monday = Date.today - ((Date.today.wday + 6) % 7) + (offset * 7)
-  days = (0..6).map { |n| monday + n }
-else
-  days = [Date.today + offset]
-end
-
-rows = parse_rows(days.first, days.last)
-if rows.nil?
-  puts JSON.generate(ok: false, error: "gcalcli onbereikbaar", events: [], allday: [], days: [])
-  exit 0
-end
-
-built = days.map { |day| build_day(rows, day) }
-today = built.find { |d| d[:is_today] }
-
-# De bar gaat altijd over vandaag en over jouw eigen agenda; bladeren of in
-# andermans week kijken mag hem niet veranderen.
-upcoming = ONLY_CALENDAR.nil? && today ? upcoming_from(today[:events], now) : nil
-
-payload = {
-  ok: true,
-  mode: mode,
-  offset: offset,
-  only_calendar: ONLY_CALENDAR,
-  now: now.strftime("%H:%M"),
-  now_minutes: now.hour * 60 + now.min,
-  upcoming: upcoming,
-  days: built,
+# weekday => [[start, end, title, calendar], ...]. Nothing overlaps here: a
+# demo week is meant to read at a glance, and two appointments sharing an hour
+# make you work out what you are looking at before you see anything else.
+# Python counts Monday as 0, so these are shifted by one against the tsv.
+DEMO_WEEK = {
+    0: [["09:00", "09:15", "Standup", "Work"],
+        ["11:00", "12:00", "Design review", "Work"],
+        ["14:00", "17:00", "Focus time", "Work"],
+        ["19:30", "21:00", "Gym", "Personal"]],
+    1: [["09:00", "09:15", "Standup", "Work"],
+        ["10:00", "11:30", "Backlog refinement", "Work"],
+        ["15:00", "16:00", "Customer call", "Work"]],
+    2: [["09:00", "09:15", "Standup", "Work"],
+        ["10:00", "13:00", "Architecture workshop", "Shared"],
+        ["14:00", "15:00", "Retro", "Work"],
+        ["19:30", "21:00", "Gym", "Personal"]],
+    3: [["09:00", "09:15", "Standup", "Work"],
+        ["09:30", "10:30", "Pairing on the importer", "Work"],
+        ["12:00", "13:00", "Lunch with Sam", "Personal"]],
+    4: [["09:00", "09:15", "Standup", "Work"],
+        ["11:00", "12:00", "Sprint demo", "Work"],
+        ["15:00", "16:00", "Week wrap-up", "Work"]],
+    5: [["09:00", "10:30", "Bootcamp", "Personal"]],
+    6: [],
 }
 
-if mode == "week"
-  # De weekweergave van Google gebruikt de maandag als anker.
-  payload[:date_path] = built.first[:date_path]
-  payload[:date_label] = "#{days.first.strftime('%-d %b')} - #{days.last.strftime('%-d %b')}"
-  payload[:is_today] = offset.zero?
-else
-  payload.merge!(built.first.slice(:date_path, :date_label, :is_today, :events, :allday))
-end
+# Which demo appointments carry a meeting link, so the row of buttons in the
+# detail card is not something that only exists in theory.
+DEMO_MEET = ["Standup", "Design review", "Backlog refinement", "Customer call",
+             "Retro", "Sprint demo"]
 
-puts JSON.generate(payload)
+DEMO_DETAILS = {
+    "Standup": {
+        "description": "Fifteen minutes, blockers only.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Maya Lindqvist", "email": "maya@example.com", "status": "accepted"},
+            {"name": "Ruben Sol", "email": "ruben@example.com", "status": "accepted"},
+            {"name": "Ines Ferreira", "email": "ines@example.com", "status": "needsAction"},
+        ],
+    },
+    "Design review": {
+        "location": "Studio, second floor",
+        "description": "Walk through the onboarding screens and decide what ships this week.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Maya Lindqvist", "email": "maya@example.com", "status": "accepted"},
+            {"name": "Ruben Sol", "email": "ruben@example.com", "status": "tentative"},
+        ],
+    },
+    "Backlog refinement": {
+        "description": "Top of the backlog, estimates on anything that is not clear yet.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Ines Ferreira", "email": "ines@example.com", "status": "accepted"},
+        ],
+    },
+    "Customer call": {
+        "description": "Renewal conversation. They asked for the export feature twice last quarter.",
+        "attendees": [
+            {"name": "Ines Ferreira", "email": "ines@example.com", "status": "accepted"},
+            {"name": "Tom Devries", "email": "tom@buyer.example", "status": "accepted"},
+        ],
+    },
+    "Architecture workshop": {
+        "location": "Office, top floor",
+        "description": "All day, bring a laptop. Lunch is arranged.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Maya Lindqvist", "email": "maya@example.com", "status": "declined"},
+            {"name": "Ruben Sol", "email": "ruben@example.com", "status": "accepted"},
+        ],
+    },
+    "Retro": {
+        "description": "What went well, what did not, one thing we change.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Ruben Sol", "email": "ruben@example.com", "status": "accepted"},
+        ],
+    },
+    "Pairing on the importer": {
+        "description": "Finish the retry path and get the tests green.",
+        "attendees": [
+            {"name": "Maya Lindqvist", "email": "maya@example.com", "status": "accepted"},
+        ],
+    },
+    "Sprint demo": {
+        "description": "Show what shipped. Fifteen minutes each, no slides.",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+            {"name": "Maya Lindqvist", "email": "maya@example.com", "status": "accepted"},
+            {"name": "Ines Ferreira", "email": "ines@example.com", "status": "accepted"},
+            {"name": "Tom Devries", "email": "tom@buyer.example", "status": "tentative"},
+        ],
+    },
+    "Lunch with Sam": {
+        "location": "The cafe on the corner",
+        "attendees": [
+            {"name": "Sam Okafor", "email": "sam@example.com", "status": "accepted"},
+        ],
+    },
+    "Gym": {"location": "The gym"},
+    "Bootcamp": {"location": "The park"},
+}
+
+# One all-day event, on the Thursday, so the strip above the grid is not empty
+# in a screenshot.
+DEMO_ALLDAY = {"weekday": 3, "title": "Release day", "calendar": "Shared"}
+
+
+def demo_slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower())
+
+
+def demo_rows(from_day, to_day):
+    rows = []
+    day = from_day
+    while day <= to_day:
+        stamp = day.strftime("%Y-%m-%d")
+
+        for start_time, end_time, title, calendar in DEMO_WEEK.get(day.weekday(), []):
+            row = dict(DEMO_DETAILS.get(title, {}))
+            row.update({
+                "id": "demo-" + stamp + "-" + demo_slug(title),
+                "start_date": stamp, "start_time": start_time,
+                "end_date": stamp, "end_time": end_time,
+                "title": title, "calendar": calendar,
+                "hangout_link": "",
+                "html_link": ("https://calendar.google.com/calendar/event?eid=demo"
+                              if title in DEMO_MEET else ""),
+                "conference_uri": ("https://meet.google.com/abc-defg-hij"
+                                   if title in DEMO_MEET else ""),
+            })
+            rows.append(row)
+
+        if day.weekday() == DEMO_ALLDAY["weekday"]:
+            rows.append({
+                "id": "demo-" + stamp + "-" + demo_slug(DEMO_ALLDAY["title"]),
+                "start_date": stamp, "start_time": "",
+                # gcalcli reports the end date exclusive, so an all-day event
+                # that runs for one day ends on the next.
+                "end_date": (day + timedelta(days=1)).strftime("%Y-%m-%d"), "end_time": "",
+                "title": DEMO_ALLDAY["title"], "calendar": DEMO_ALLDAY["calendar"],
+                "html_link": "", "hangout_link": "", "conference_uri": "",
+            })
+
+        day += timedelta(days=1)
+    return rows
+
+
+def parse_rows(from_day, to_day):
+    """Read the columns by name rather than by position: the order shifts with
+    every --details that gets added, and then everything silently shifts along
+    with it. Without an explicit range, gcalcli agenda starts at now, so
+    yesterday simply does not exist and paging back gives an empty day. The
+    range runs to the day after, because gcalcli treats the end as exclusive."""
+    if DEMO:
+        return demo_rows(from_day, to_day)
+    if not authenticated():
+        return None
+
+    command = ["gcalcli", "agenda", "--tsv", "--nodeclined", "--details", "all",
+               from_day.strftime("%Y-%m-%d"),
+               (to_day + timedelta(days=1)).strftime("%Y-%m-%d")]
+    try:
+        # stdin closed: gcalcli falls back to asking questions when it can, and
+        # nothing here is ever in a position to answer one.
+        result = subprocess.run(command, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    lines = result.stdout.splitlines()
+    if not lines:
+        return []
+
+    headers = lines[0].split("\t")
+    return [dict(zip(headers, line.split("\t"))) for line in lines[1:]]
+
+
+def parse_attendees(value):
+    """Attendees do not come out of gcalcli's tsv; the demo supplies them, and a
+    later source can fill the same field. Anything that is not a list is ignored
+    rather than shown half-way."""
+    if not isinstance(value, list):
+        return []
+
+    people = []
+    for entry in value:
+        if isinstance(entry, str):
+            people.append({"name": entry, "email": "", "status": ""})
+            continue
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or entry.get("email") or "")
+        if not name:
+            continue
+        people.append({
+            "name": name,
+            "email": str(entry.get("email") or ""),
+            "status": str(entry.get("status") or ""),
+        })
+    return people
+
+
+def event_from(row, day):
+    start_date = row.get("start_date")
+    start_time = row.get("start_time")
+    end_date = row.get("end_date")
+    end_time = row.get("end_time")
+    title = row.get("title")
+    calendar = row.get("calendar")
+
+    # html_link carries the eid Google uses itself, so there is nothing to
+    # rebuild out of the event and calendar ids.
+    link = str(row.get("html_link") or "")
+    # The conference uri is the meeting link when there is no separate hangout
+    # field: the older Hangouts link and the newer Meet conference sit in
+    # different columns.
+    hangout = str(row.get("hangout_link") or "") or str(row.get("conference_uri") or "")
+
+    # What the detail card shows. Empty stays empty: a heading with nothing
+    # under it is worse than no heading.
+    details = {
+        "id": str(row.get("id") or ""),
+        "location": str(row.get("location") or ""),
+        "description": str(row.get("description") or ""),
+        "organizer": str(row.get("email") or ""),
+    }
+
+    if not title:
+        return None
+    if title in SKIP_TITLES:
+        return None
+
+    if ONLY_CALENDAR:
+        if str(calendar or "") != ONLY_CALENDAR:
+            return None
+    elif VISIBLE is not None:
+        # Your own choice in the panel is the whole answer. Two filters side by
+        # side would mean that ticking a calendar does nothing at all, and that
+        # cannot be explained to anyone looking at the list.
+        if str(calendar or "") not in VISIBLE:
+            return None
+    elif calendar in SKIP_CALENDARS:
+        return None
+
+    style = style_for(calendar)
+
+    # All-day events have no time and often run across several days. gcalcli
+    # gives the end date exclusive, just as the Google API does.
+    if not start_time:
+        first = date.fromisoformat(start_date)
+        last = date.fromisoformat(end_date) - timedelta(days=1)
+        if not (first <= day <= last):
+            return None
+
+        event = {
+            "allday": True, "title": title, "calendar": calendar,
+            "color": style["color"], "priority": style["priority"],
+            "multiday": first != last,
+            "link": link,
+        }
+        event.update(details)
+        return event
+
+    starts = datetime.strptime("%s %s" % (start_date, start_time), "%Y-%m-%d %H:%M")
+    ends = datetime.strptime("%s %s" % (end_date, end_time), "%Y-%m-%d %H:%M")
+    if starts.date() != day:
+        return None
+
+    event = {
+        "allday": False,
+        "title": title,
+        "calendar": calendar,
+        "color": style["color"],
+        "priority": style["priority"],
+        "start": starts.strftime("%H:%M"),
+        "end": ends.strftime("%H:%M"),
+        "start_minutes": starts.hour * 60 + starts.minute,
+        "end_minutes": ends.hour * 60 + ends.minute,
+        "start_epoch": int(starts.timestamp()),
+        "end_epoch": int(ends.timestamp()),
+        "link": link,
+        "hangout": hangout,
+        "minutes": round((ends - starts).total_seconds() / 60),
+    }
+    event.update(details)
+    return event
+
+
+def assign_columns(events):
+    """Overlapping appointments side by side, the way a calendar does it.
+    Without this they draw on top of each other and everything inside a long
+    appointment disappears: a working day from 09:00 to 18:00 swallows the four
+    meetings that sit within it.
+
+    Cluster on overlap first, then take the first free column within a cluster.
+    Every event carries its column and the cluster total, so the widget only
+    has to divide."""
+    cluster = []
+    cluster_end = None
+
+    def flush():
+        columns = []
+        for event in cluster:
+            slot = next((i for i, free_at in enumerate(columns)
+                         if free_at <= event["start_minutes"]), None)
+            if slot is None:
+                columns.append(event["end_minutes"])
+                slot = len(columns) - 1
+            else:
+                columns[slot] = event["end_minutes"]
+            event["column"] = slot
+        for event in cluster:
+            event["columns"] = len(columns)
+        cluster.clear()
+
+    for event in events:
+        if cluster_end is None or event["start_minutes"] < cluster_end:
+            cluster.append(event)
+            cluster_end = max(cluster_end or 0, event["end_minutes"])
+        else:
+            flush()
+            cluster.append(event)
+            cluster_end = event["end_minutes"]
+    flush()
+
+    return events
+
+
+def build_day(rows, day):
+    """One day, assembled from the rows of the whole requested range."""
+    parsed = [event for event in (event_from(row, day) for row in rows) if event]
+
+    # Deduplicate on title plus start time: the same appointment often sits in
+    # two calendars that you are both looking at.
+    seen = set()
+    timed = []
+    for event in parsed:
+        if event["allday"]:
+            continue
+        key = "%s|%s" % (event["title"], event["start_epoch"])
+        if key in seen:
+            continue
+        seen.add(key)
+        timed.append(event)
+    timed.sort(key=lambda e: e["start_minutes"])
+
+    return {
+        # Without leading zeroes, because that is how Google Calendar wants it
+        # in its url.
+        "date_path": "%d/%d/%d" % (day.year, day.month, day.day),
+        "date_label": day.strftime("%A %-d %B"),
+        "short_label": day.strftime("%a %-d"),
+        "is_today": day == date.today(),
+        "events": assign_columns(timed),
+        "allday": [event for event in parsed if event["allday"]],
+    }
+
+
+def upcoming_from(timed, now):
+    """What the bar shows. A running appointment comes first, then the next one;
+    on a tie the calendar with the highest priority wins. Only about today:
+    paging a day back or forward does not change the bar."""
+    stamp = int(now.timestamp())
+    live = [e for e in timed if e["start_epoch"] <= stamp < e["end_epoch"]]
+    if live:
+        return min(live, key=lambda e: (e["priority"], e["start_epoch"]))
+    ahead = [e for e in timed if e["start_epoch"] > stamp]
+    if ahead:
+        return min(ahead, key=lambda e: (e["start_epoch"], e["priority"]))
+    return None
+
+
+# The list of calendars changes about never, and asking gcalcli for it on every
+# refresh would mean a second process every minute. An hour old is fresh enough.
+CACHE_PATH = home_path("XDG_CACHE_HOME", ".cache", "omarchy-meetings", "calendars.json")
+CACHE_MAX_AGE = 3600
+
+DEMO_CALENDAR_NAMES = ["Work", "Personal", "Shared"]
+
+
+# gcalcli colours its table even when nobody is watching, and those escapes
+# are the first thing on every line. Read as text they look like the first
+# column, which turned every calendar name into "owner <name>" and let the
+# header through as a calendar of its own.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def fetch_calendars():
+    """gcalcli prints a table: a header, a rule of dashes, then one row per
+    calendar with the access level first and the title filling the rest."""
+    if DEMO:
+        return list(DEMO_CALENDAR_NAMES)
+    if not authenticated():
+        return None
+
+    try:
+        result = subprocess.run(["gcalcli", "list"], capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    names = []
+    for raw in result.stdout.splitlines():
+        line = ANSI.sub("", raw)
+        match = re.match(r"\A\s*\S+\s+(\S.*?)\s*\Z", line)
+        if not match:
+            continue
+        title = match.group(1)
+        if title == "Title" or re.match(r"\A-+\Z", title):
+            continue
+        names.append(title)
+    return names
+
+
+def cached_calendars():
+    """A cache must never be the thing that breaks the script, so anything that
+    is not the shape we wrote is treated as no cache at all."""
+    try:
+        if (os.path.isfile(CACHE_PATH) and not os.path.islink(CACHE_PATH)
+                and (datetime.now().timestamp() - os.path.getmtime(CACHE_PATH)) < CACHE_MAX_AGE):
+            parsed = read_json(CACHE_PATH, None)
+            if isinstance(parsed, list) and parsed:
+                return [str(name) for name in parsed]
+    except OSError:
+        pass  # fall through and ask gcalcli again
+
+    fresh = fetch_calendars()
+    if not fresh:
+        return []
+
+    write_private(CACHE_PATH, json.dumps(fresh))
+    return fresh
+
+
+def dump(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+
+
+def main():
+    # Two commands the panel calls directly, both outside the agenda path.
+    command = ARGV[0] if ARGV else ""
+
+    if command == "calendars":
+        dump(cached_calendars())
+        return 0
+
+    if command == "attendees":
+        # One appointment, asked for at the moment you open it. Not on every
+        # refresh: that would be an API call a minute for something you only
+        # ever see when you ask for it.
+        calendar_name = ARGV[1] if len(ARGV) > 1 else ""
+        event_id = ARGV[2] if len(ARGV) > 2 else ""
+
+        if DEMO:
+            for title, details in DEMO_DETAILS.items():
+                if event_id.endswith("-" + demo_slug(title)):
+                    dump(parse_attendees(details.get("attendees")))
+                    return 0
+            dump([])
+            return 0
+
+        if not event_id or not calendar_name:
+            dump([])
+            return 0
+
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetings-attendees")
+        try:
+            # The argument list goes straight to the process, so no shell is
+            # involved that could split a calendar name with a space in it.
+            result = subprocess.run([helper, calendar_name, event_id],
+                                    capture_output=True, text=True)
+            sys.stdout.write(result.stdout if result.returncode == 0 and result.stdout.strip()
+                             else "[]\n")
+        except OSError:
+            sys.stdout.write("[]\n")
+        return 0
+
+    if command == "set-view":
+        wanted = "day" if (len(ARGV) > 1 and ARGV[1] == "day") else "week"
+        merged = dict(STATE)
+        merged["view"] = wanted
+        dump({"ok": write_private(STATE_PATH, json.dumps(merged)), "view": wanted})
+        return 0
+
+    if command == "set-calendars":
+        # Everything after the command is a calendar name. An empty list would
+        # mean an empty grid with no way back from the panel, so it is stored as
+        # "all of them" instead, which is also what a fresh install shows.
+        chosen = [name for name in ARGV[1:] if name]
+        merged = dict(STATE)
+        merged["visibleCalendars"] = chosen
+        ok = write_private(STATE_PATH, json.dumps(merged))
+        dump({"ok": ok, "visible": chosen or None})
+        return 0
+
+    mode = "week" if command == "week" else "day"
+    second = ARGV[1] if len(ARGV) > 1 else ""
+    try:
+        offset = 0 if second.startswith("--") else int(second or 0)
+    except ValueError:
+        offset = 0
+    now = datetime.now()
+    today = date.today()
+
+    # In week mode the offset counts in weeks and the week starts on Monday,
+    # the way Google Calendar does it.
+    if mode == "week":
+        monday = today - timedelta(days=today.weekday()) + timedelta(days=offset * 7)
+        days = [monday + timedelta(days=n) for n in range(7)]
+    else:
+        days = [today + timedelta(days=offset)]
+
+    rows = parse_rows(days[0], days[-1])
+    if rows is None:
+        # Two different problems that need two different answers: one is fixed
+        # by installing something, the other by logging in.
+        missing = shutil.which("gcalcli") is None
+        dump({"ok": False,
+              "error": "gcalcli-missing" if missing else
+                       ("not-authenticated" if not authenticated() else "gcalcli-failed"),
+              "events": [], "allday": [], "days": []})
+        return 0
+
+    built = [build_day(rows, day) for day in days]
+    today_built = next((d for d in built if d["is_today"]), None)
+
+    # The bar is always about today and about your own calendar; paging around,
+    # or looking at someone else's week, must not change it.
+    upcoming = (upcoming_from(today_built["events"], now)
+                if ONLY_CALENDAR is None and today_built else None)
+
+    known = cached_calendars()
+    payload = {
+        "ok": True,
+        "mode": mode,
+        "offset": offset,
+        "only_calendar": ONLY_CALENDAR,
+        # The panel needs to know whether there is a colleague's calendar to
+        # borrow before it can decide whether to draw the toggle for it, and the
+        # config file is the only place that knows. Sending it along beats
+        # teaching the QML to read the file a second time.
+        "borrowed": BORROWED_CALENDAR,
+        # The panel draws the calendar picker from these two: everything there
+        # is, and what is ticked. A null selection means nothing has been
+        # unticked yet, and the panel then shows them all as on.
+        "calendars": known,
+        # With no choice of your own the starting position is everything except
+        # what the config skips, and that is exactly what the boxes have to show.
+        "visible": VISIBLE if VISIBLE is not None
+                   else [name for name in known if name not in SKIP_CALENDARS],
+        "view": VIEW,
+        "now": now.strftime("%H:%M"),
+        "now_minutes": now.hour * 60 + now.minute,
+        "upcoming": upcoming,
+        "days": built,
+    }
+
+    if mode == "week":
+        # Google's week view uses the Monday as its anchor.
+        payload["date_path"] = built[0]["date_path"]
+        payload["date_label"] = "%s - %s" % (days[0].strftime("%-d %b"),
+                                             days[-1].strftime("%-d %b"))
+        payload["is_today"] = offset == 0
+    else:
+        for key in ("date_path", "date_label", "is_today", "events", "allday"):
+            payload[key] = built[0][key]
+
+    dump(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

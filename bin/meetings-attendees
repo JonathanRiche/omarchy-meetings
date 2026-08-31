@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""meetings-attendees: who is coming to one appointment.
+
+gcalcli's tsv output has no attendees column, and its human-readable output
+prints them without an event id, so there is nothing there to match on. This
+asks the Calendar API instead, reusing the token gcalcli already stored: no
+second login, and no credential of this plugin's own.
+
+    meetings-attendees <calendar-name> <event-id>
+
+Prints a JSON list of {name, email, status}. Any failure prints an empty list
+and exits 0, because a panel that cannot show attendees should still show the
+appointment.
+"""
+
+import json
+import os
+import pickle
+import sys
+from pathlib import Path
+
+
+def data_dir() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "gcalcli"
+
+
+def load_credentials():
+    path = data_dir() / "oauth"
+    # A symlink on this path would hand someone else's file to pickle.load,
+    # which runs code by design.
+    if not path.is_file() or path.is_symlink():
+        return None
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def status_of(attendee: dict) -> str:
+    return str(attendee.get("responseStatus") or "")
+
+
+def name_of(attendee: dict) -> str:
+    return str(attendee.get("displayName") or attendee.get("email") or "")
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("[]")
+        return 0
+
+    wanted_calendar, event_id = sys.argv[1], sys.argv[2]
+
+    credentials = load_credentials()
+    if credentials is None:
+        print("[]")
+        return 0
+
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    if getattr(credentials, "expired", False) and getattr(credentials, "refresh_token", None):
+        credentials.refresh(Request())
+
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+
+    # The tsv names a calendar by its title; the API wants its id.
+    calendar_id = None
+    page_token = None
+    while calendar_id is None:
+        page = service.calendarList().list(pageToken=page_token).execute()
+        for entry in page.get("items", []):
+            if entry.get("summary") == wanted_calendar:
+                calendar_id = entry.get("id")
+                break
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+
+    if calendar_id is None:
+        print("[]")
+        return 0
+
+    event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+
+    people = []
+    for attendee in event.get("attendees", []):
+        if attendee.get("resource"):
+            continue  # a room, not a person
+        name = name_of(attendee)
+        if not name:
+            continue
+        people.append({
+            "name": name,
+            "email": str(attendee.get("email") or ""),
+            "status": status_of(attendee),
+        })
+
+    print(json.dumps(people))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        # Never let a broken lookup take the panel down with it.
+        print("[]")
+        sys.exit(0)

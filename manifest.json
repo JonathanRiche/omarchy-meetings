@@ -4,7 +4,7 @@
   "name": "Meetings",
   "version": "1.0.0",
   "author": "Jankees",
-  "description": "Today's agenda as a day column, with a now line",
+  "description": "Your day as a column, with a line where you are in it. Overlapping appointments sit side by side.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Meetings",
-    "description": "Today's agenda as a day column, with a now line",
+    "description": "Your day as a column, with a line where you are in it. Overlapping appointments sit side by side.",
     "category": "Apps",
     "allowMultiple": false,
     "defaultSection": "right"
