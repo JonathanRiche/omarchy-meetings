@@ -20,13 +20,13 @@ omarchy plugin enable jankeesvw.meetings
 omarchy bar move jankeesvw.meetings --section right
 ```
 
-The only requirement is [gcalcli](https://github.com/insanum/gcalcli), which reads your Google Calendar from the command line. It is in the AUR, and because gcalcli is itself a Python program, the interpreter this plugin needs comes along with it. Nothing else to install.
+Google Calendar is the default provider. Its only requirement is [gcalcli](https://github.com/insanum/gcalcli), which is in the AUR. Because gcalcli is itself a Python program, the interpreter this plugin needs comes along with it.
 
 ```bash
 yay -S gcalcli
 ```
 
-## Signing in
+## Google Calendar
 
 Until gcalcli is authenticated the panel says so, and hands you the instructions rather than an error.
 
@@ -41,7 +41,36 @@ gcalcli list     # should now print your calendars
 
 `init` stores a token in `~/.local/share/gcalcli`. There is nothing to log into separately: this plugin runs gcalcli, and the attendee lookup borrows that same token. If you would rather use your own Google Cloud OAuth client, pass `--client-id` and `--client-secret` to `gcalcli init` and the rest works the same.
 
+## Outlook and Microsoft Teams
+
+Outlook works through [CLI for Microsoft 365](https://pnp.github.io/cli-microsoft365/). Install it and set the provider in `~/.config/omarchy-meetings/config.json`:
+
+```bash
+npm i -g @pnp/cli-microsoft365
+```
+
+```json
+{ "provider": "microsoft" }
+```
+
+Set up the CLI with the minimal `User.Read` permission and choose scripting use:
+
+```bash
+m365 setup
+```
+
+In Microsoft Entra, add the delegated Microsoft Graph permission `Calendars.Read` to the app that `setup` created. Some work accounts need an administrator to approve it. Then sign in:
+
+```bash
+m365 login
+m365 status --output json
+```
+
+The widget uses that login for Outlook. Teams links become the join button, and attendees are fetched only when you open an appointment.
+
 The button in that panel copies a set of instructions to your clipboard, written to be handed straight to a coding agent if you would rather not do it yourself.
+
+![Outlook Calendar in the week view](screenshots/microsoft.png)
 
 ## What you get
 
@@ -53,15 +82,15 @@ The button in that panel copies a set of instructions to your clipboard, written
 
 **Getting into the call.** A meeting that is running, or starts within five minutes, puts a join button in the header. One click and you are in it. Outside that window the button is not there, so it never sends you into the wrong call.
 
-**One appointment, opened.** Press Enter or click, and it expands into a card over the grid: when it is and how long it runs, which calendar it came from, where it is, who is coming and whether they answered, and the description. One button joins the video call, another opens it in Google Calendar. Escape goes back to the grid.
+**One appointment, opened.** Press Enter or click, and it expands into a card over the grid: when it is and how long it runs, which calendar it came from, where it is, who is coming and whether they answered, and the description. One button joins the video call, another opens it in the configured calendar. Escape goes back to the grid.
 
 ![An appointment opened over the week](screenshots/detail.png)
 
-Attendees do not come out of gcalcli, whose output has no attendees column and no event id to match them on. They are fetched from the Calendar API for the one appointment you opened, reusing the token gcalcli already stored, and only at the moment you ask for them.
+With Google, attendees do not come out of gcalcli's output, so they are fetched from the Calendar API by reusing gcalcli's token. With Microsoft, the widget asks Graph through `m365`. Either way, this happens only for the one appointment you opened and only at the moment you ask for it.
 
 **How much room a gap really is.** Move the mouse into the space between two appointments and it hatches, with the span named in the middle. If that gap is running right now, it counts from this minute rather than from the end of the last meeting, because the part that has already passed is not time you still have.
 
-**Which calendars you see.** The picker at the bottom lists your calendars by the names Google gives them. Untick the one full of other people's birthdays and it is gone from the grid, this week and every week after, until you tick it back.
+**Which calendars you see.** The picker at the bottom lists your calendars by name. Untick the one full of other people's birthdays and it is gone from the grid, this week and every week after, until you tick it back.
 
 **Everything from the keyboard.** Tab walks the switch, every appointment and the controls at the bottom. Arrows move between appointments and left and right page through days or weeks. Enter opens what you are on, Escape steps back out.
 
@@ -79,7 +108,9 @@ Without a config every calendar is drawn in the same grey. Naming them is what m
 }
 ```
 
-`match` is a regular expression, tried in order against the calendar name as `gcalcli list` prints it. `priority` decides which appointment the bar picks when two run at once, lowest number first.
+For Outlook, keep `"provider": "microsoft"` alongside the `calendars` key in that same object.
+
+`match` is a regular expression, tried in order against the calendar name as the selected provider prints it. `priority` decides which appointment the bar picks when two run at once, lowest number first.
 
 Three more keys are optional:
 
@@ -101,7 +132,7 @@ Changes are picked up on the next refresh, within a minute. No restart needed.
 
 ## Trying it without a calendar
 
-The plugin can make up a week, which is useful before you set gcalcli up and for taking screenshots without your own appointments in them:
+The plugin can make up a week, which is useful before you set a provider up and for taking screenshots without your own appointments in them:
 
 ```json
 { "demo": true }
@@ -129,6 +160,8 @@ cd ~/.config/omarchy/plugins/jankeesvw.meetings/bin
 
 Every appointment carries its start and end, its duration in minutes, the calendar it came from, its colour, its location, its description and its links. Which makes `./meetings-widget week | jq '[.days[].events[]] | length'` a fair answer to how bad next week is.
 
+The command reads the provider from `config.json`; `MEETINGS_PROVIDER=microsoft` overrides it for one invocation.
+
 ## Removing it
 
 ```bash
@@ -137,11 +170,11 @@ omarchy plugin remove jankeesvw.meetings
 
 That leaves three files behind, all of which you can delete by hand:
 
-- `~/.config/omarchy-meetings/config.json`, your colours and filters. Holds the names of your calendars, and the name of the colleague whose calendar you can borrow if you configured one.
+- `~/.config/omarchy-meetings/config.json`, your provider, colours and filters. Holds the names of your calendars, and the name of the colleague whose calendar you can borrow if you configured one.
 - `~/.config/omarchy-meetings/state.json`, which calendars you ticked and whether you left it on the week or the day. Calendar names again.
-- `~/.cache/omarchy-meetings/calendars.json`, that same list of names, kept for an hour so the widget does not ask gcalcli every minute.
+- `~/.cache/omarchy-meetings/calendars.json`, the provider plus calendar names and ids, kept for an hour so the widget does not ask the provider every minute.
 
-No appointments are ever written to disk. Titles, attendees and descriptions are read fresh each time the panel refreshes and are gone when the shell stops, so what survives a removal is those three files and nothing about your actual days. gcalcli keeps its own credentials in `~/.local/share/gcalcli`, which is not this plugin's to remove.
+No appointments are ever written to disk. Titles, attendees and descriptions are read fresh each time the panel refreshes and are gone when the shell stops, so what survives a removal is those three files and nothing about your actual days. gcalcli keeps its credentials in `~/.local/share/gcalcli`; CLI for Microsoft 365 keeps its own connection data separately. Neither belongs to this plugin, so removing the plugin does not sign either provider out.
 
 ## Licence
 
