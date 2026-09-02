@@ -96,6 +96,8 @@ With Google, attendees do not come out of gcalcli's output, so they are fetched 
 
 **A compact bar when space is tight.** Right-click the meeting in the bar to collapse it to a calendar icon. Right-click again to bring the full label back. Left-click still opens the calendar and middle-click refreshes it.
 
+![Expanded and compact bar states](screenshots/compact-toggle.png)
+
 ## Colours
 
 Without a config every calendar is drawn in the same grey. Naming them is what makes a week readable at a glance, so write `~/.config/omarchy-meetings/config.json`:
