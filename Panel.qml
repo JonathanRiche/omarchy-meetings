@@ -775,6 +775,7 @@ Panel {
                               ringLength: root.ringLength, cursor: root.cursor,
                               calendars: root.calendars, visible: root.visibleCalendars,
                               checked: root.checkedCalendars,
+                              compact: root.compact,
                               pickerOpen: calendarPicker.popupOpen })
     }
   }
@@ -902,14 +903,14 @@ Panel {
             color: root.upcoming ? root.upcoming.color : "transparent"
           }
 
-          Text {
-            textFormat: Text.PlainText
+          OpticalGlyph {
             anchors.verticalCenter: parent.verticalCenter
+            width: Style.bar.iconCanvas
+            height: Style.bar.iconCanvas
             visible: root.compact || root.upcoming === null
             text: root.iconCalendar
-            font.family: root.fontFamily
-            font.pixelSize: Style.bar.iconFont
-            renderType: Text.NativeRendering
+            fontFamily: root.fontFamily
+            fontSize: Style.bar.iconFont
             color: root.almostDue ? Color.background : root.foreground
           }
 

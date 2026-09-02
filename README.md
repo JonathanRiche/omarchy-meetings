@@ -96,7 +96,13 @@ With Google, attendees do not come out of gcalcli's output, so they are fetched 
 
 **A compact bar when space is tight.** Right-click the meeting in the bar to collapse it to a calendar icon. Right-click again to bring the full label back. Left-click still opens the calendar and middle-click refreshes it.
 
-![Expanded and compact bar states](screenshots/compact-toggle.png)
+Expanded:
+
+![Expanded meeting label](screenshots/bar-expanded.png)
+
+Compact:
+
+![Compact calendar icon](screenshots/bar-compact.png)
 
 ## Colours
 
