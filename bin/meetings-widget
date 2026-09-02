@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -118,17 +119,46 @@ VIEW = "day" if STATE.get("view") == "day" else "week"
 GCALCLI_OAUTH = home_path("XDG_DATA_HOME", ".local/share", "gcalcli", "oauth")
 
 
-def run_json(command):
-    """Run a non-interactive CLI command and decode its JSON answer."""
+# Everything a CLI hands back is read through one ceiling, in bytes and in
+# seconds. A week of calendar data is kilobytes, so the ceiling is generous;
+# it exists because an answer past it means the source is broken or hostile,
+# and half an answer must never be parsed as if it were whole. Overflow and
+# timeout therefore both read as failure, never as data.
+MAX_CLI_BYTES = 8 * 1024 * 1024
+CLI_TIMEOUT_SECONDS = 90
+
+
+def run_capped(command, timeout=CLI_TIMEOUT_SECONDS):
+    """Run a non-interactive CLI and hand back its stdout, or None."""
     try:
-        result = subprocess.run(command, capture_output=True, text=True,
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL)
     except OSError:
         return None
-    if result.returncode != 0:
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    try:
+        data = proc.stdout.read(MAX_CLI_BYTES + 1)
+        overflow = len(data) > MAX_CLI_BYTES
+        if overflow:
+            proc.kill()
+        proc.stdout.close()
+        status = proc.wait()
+    finally:
+        timer.cancel()
+    if overflow or status != 0:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def run_json(command):
+    """Run a non-interactive CLI command and decode its JSON answer."""
+    out = run_capped(command)
+    if out is None:
         return None
     try:
-        return json.loads(result.stdout)
+        return json.loads(out)
     except (TypeError, ValueError):
         return None
 
@@ -449,17 +479,13 @@ def parse_google_rows(from_day, to_day):
     command = ["gcalcli", "agenda", "--tsv", "--nodeclined", "--details", "all",
                from_day.strftime("%Y-%m-%d"),
                (to_day + timedelta(days=1)).strftime("%Y-%m-%d")]
-    try:
-        # stdin closed: gcalcli falls back to asking questions when it can, and
-        # nothing here is ever in a position to answer one.
-        result = subprocess.run(command, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL)
-    except OSError:
-        return None
-    if result.returncode != 0:
+    # stdin closed inside run_capped: gcalcli falls back to asking questions
+    # when it can, and nothing here is ever in a position to answer one.
+    out = run_capped(command)
+    if out is None:
         return None
 
-    lines = result.stdout.splitlines()
+    lines = out.splitlines()
     if not lines:
         return []
 
@@ -876,16 +902,12 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 def fetch_google_calendars():
     """gcalcli prints a table: a header, a rule of dashes, then one row per
     calendar with the access level first and the title filling the rest."""
-    try:
-        result = subprocess.run(["gcalcli", "list"], capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL)
-    except OSError:
-        return None
-    if result.returncode != 0:
+    out = run_capped(["gcalcli", "list"])
+    if out is None:
         return None
 
     names = []
-    for raw in result.stdout.splitlines():
+    for raw in out.splitlines():
         line = ANSI.sub("", raw)
         match = re.match(r"\A\s*\S+\s+(\S.*?)\s*\Z", line)
         if not match:
@@ -1037,15 +1059,11 @@ def main():
             return 0
 
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetings-attendees")
-        try:
-            # The argument list goes straight to the process, so no shell is
-            # involved that could split a calendar name with a space in it.
-            result = subprocess.run([helper, calendar_name, event_id],
-                                    capture_output=True, text=True)
-            sys.stdout.write(result.stdout if result.returncode == 0 and result.stdout.strip()
-                             else "[]\n")
-        except OSError:
-            sys.stdout.write("[]\n")
+        # The argument list goes straight to the process, so no shell is
+        # involved that could split a calendar name with a space in it, and
+        # run_capped bounds what comes back in bytes and in seconds.
+        out = run_capped([helper, calendar_name, event_id])
+        sys.stdout.write(out if out and out.strip() else "[]\n")
         return 0
 
     if command == "set-view":
